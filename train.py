@@ -1,15 +1,12 @@
 """
 PetiteLLM: Preference — reward model training script.
 
-Baseline: small transformer encoder takes [prompt <resp> response <end>] tokens,
-mean-pools, feeds through a scalar head to produce r(prompt, response). Trained
-with pairwise Bradley-Terry loss on UltraFeedback pairs. Saves fp16 + zlib
-compressed artifact. Provides two entry points required by eval/evaluate.py:
+Small transformer encoder scores (prompt, response) pairs. Trained with pairwise
+Bradley-Terry loss on UltraFeedback pairs. Saves fp16 + zlib compressed artifact.
 
+Required eval entry points:
     build_and_load(model_path: str) -> nn.Module
     score_batch(prompt_ids, response_ids, prompt_lens, response_lens, model) -> Tensor
-
-Agents should iterate on ARCHITECTURE, LOSS, TOKENIZATION, OPTIMIZER, QUANTIZATION.
 """
 from __future__ import annotations
 
@@ -42,18 +39,20 @@ class HP:
     num_layers = int(os.environ.get("NUM_LAYERS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
+    dropout = float(os.environ.get("DROPOUT", 0.1))
     max_prompt_len = 256
     max_resp_len = 384
     max_seq_len = max_prompt_len + max_resp_len + 2  # +<resp>,<end>
 
     # Optim
-    lr = float(os.environ.get("LR", 3e-4))
-    batch_size = int(os.environ.get("BATCH_SIZE", 16))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
-    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.01))
+    lr = float(os.environ.get("LR", 5e-4))
+    batch_size = int(os.environ.get("BATCH_SIZE", 64))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 200))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.05))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     grad_clip = float(os.environ.get("GRAD_CLIP", 1.0))
+    train_frac = float(os.environ.get("TRAIN_FRAC", 0.95))  # reserve ~5% of wallclock for save/val
 
     # Token ids populated from tokenizer.json at runtime.
     pad_id = 0
@@ -65,7 +64,7 @@ class HP:
 
 
 class RewardModel(nn.Module):
-    def __init__(self, vocab, dim, num_layers, num_heads, mlp_mult, max_seq_len, pad_id):
+    def __init__(self, vocab, dim, num_layers, num_heads, mlp_mult, max_seq_len, pad_id, dropout=0.0):
         super().__init__()
         self.pad_id = pad_id
         self.embed = nn.Embedding(vocab, dim, padding_idx=pad_id)
@@ -74,7 +73,7 @@ class RewardModel(nn.Module):
             d_model=dim,
             nhead=num_heads,
             dim_feedforward=dim * mlp_mult,
-            dropout=0.0,
+            dropout=dropout,
             batch_first=True,
             activation="gelu",
             norm_first=True,
@@ -84,42 +83,56 @@ class RewardModel(nn.Module):
         self.head = nn.Linear(dim, 1)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """ids: (B, L) int64.  Returns (B,) scalar reward."""
+        """ids: (B, L) int64. Returns (B,) scalar reward."""
         B, L = ids.shape
         pad_mask = ids.eq(self.pad_id)
         pos = torch.arange(L, device=ids.device).unsqueeze(0).expand(B, L)
         h = self.embed(ids) + self.pos(pos)
         h = self.encoder(h, src_key_padding_mask=pad_mask)
         h = self.ln(h)
-        # Mean-pool over non-pad tokens (avoid divide-by-zero).
+        # Mean-pool over non-pad tokens.
         mask = (~pad_mask).unsqueeze(-1).to(h.dtype)
         denom = mask.sum(dim=1).clamp_min(1.0)
         pooled = (h * mask).sum(dim=1) / denom
         return self.head(pooled).squeeze(-1)
 
 
-# ----------------------------- packing -----------------------------
+# ----------------------------- packing (vectorized) -----------------------------
 
 
 def pack_prompt_response(
     prompt: torch.Tensor, resp: torch.Tensor, prompt_len: torch.Tensor, resp_len: torch.Tensor,
     resp_sep: int, end_id: int, pad_id: int, max_total: int,
 ) -> torch.Tensor:
-    """Builds [prompt[:pl], resp_sep, resp[:rl], end_id, pad...] as (B, L)."""
-    B = prompt.size(0)
-    out = torch.full((B, max_total), pad_id, dtype=torch.long, device=prompt.device)
-    for i in range(B):
-        pl = int(prompt_len[i].item())
-        rl = int(resp_len[i].item())
-        total = pl + 1 + rl + 1
-        if total > max_total:
-            # Truncate response head first to fit.
-            rl = max(0, max_total - pl - 2)
-            total = pl + 1 + rl + 1
-        out[i, :pl] = prompt[i, :pl]
-        out[i, pl] = resp_sep
-        out[i, pl + 1:pl + 1 + rl] = resp[i, :rl]
-        out[i, pl + 1 + rl] = end_id
+    """Builds [prompt[:pl], resp_sep, resp[:rl], end_id, pad...] as (B, max_total).
+
+    Fully vectorized — no Python loop. Uses torch.where + gather.
+    """
+    B, P = prompt.shape
+    _, R = resp.shape
+    device = prompt.device
+
+    # Truncate response to fit within max_total after prompt + 2 specials.
+    r_eff = torch.minimum(resp_len, (max_total - prompt_len - 2).clamp_min(0))
+
+    pos = torch.arange(max_total, device=device, dtype=prompt.dtype).unsqueeze(0).expand(B, -1)
+    p_len_b = prompt_len.unsqueeze(1)
+    r_eff_b = r_eff.unsqueeze(1)
+
+    is_prompt = pos < p_len_b
+    is_sep = pos == p_len_b
+    resp_offset = pos - p_len_b - 1  # may be negative
+    is_resp = (resp_offset >= 0) & (resp_offset < r_eff_b)
+    is_end = pos == (p_len_b + 1 + r_eff_b)
+
+    prompt_gather = prompt.gather(1, pos.clamp(0, P - 1))
+    resp_gather = resp.gather(1, resp_offset.clamp(0, R - 1))
+
+    out = torch.full((B, max_total), pad_id, dtype=prompt.dtype, device=device)
+    out = torch.where(is_prompt, prompt_gather, out)
+    out = torch.where(is_sep, torch.full_like(out, resp_sep), out)
+    out = torch.where(is_resp, resp_gather, out)
+    out = torch.where(is_end, torch.full_like(out, end_id), out)
     return out
 
 
@@ -136,25 +149,30 @@ def score_batch(prompt_ids, response_ids, prompt_lens, response_lens, model):
         return model(packed).float()
 
 
-def build_and_load(model_path: str):
-    """Instantiate architecture, decompress + load fp16 state dict."""
-    tok_meta = json.load(open("data/tokenizer.json"))
-    vocab_sz = max(HP.vocab_size, len(tok_meta.get("model", {}).get("vocab", {})) or HP.vocab_size)
-    # Populate special ids from tokenizer.json (added_tokens section).
+def _populate_special_ids():
     try:
+        tok_meta = json.load(open("data/tokenizer.json"))
         for t in tok_meta.get("added_tokens", []):
             content = t.get("content")
             tid = t.get("id")
             if content == "<pad>" and isinstance(tid, int): HP.pad_id = tid
             elif content == "<resp>" and isinstance(tid, int): HP.resp_sep_id = tid
             elif content == "<end>" and isinstance(tid, int): HP.end_id = tid
+        vocab_sz = max(HP.vocab_size, len(tok_meta.get("model", {}).get("vocab", {})) or HP.vocab_size)
+        return vocab_sz
     except Exception:
-        pass
+        return HP.vocab_size
+
+
+def build_and_load(model_path: str):
+    """Instantiate architecture, decompress + load fp16 state dict."""
+    vocab_sz = _populate_special_ids()
 
     model = RewardModel(
         vocab=vocab_sz, dim=HP.model_dim, num_layers=HP.num_layers,
         num_heads=HP.num_heads, mlp_mult=HP.mlp_mult,
         max_seq_len=HP.max_seq_len, pad_id=HP.pad_id,
+        dropout=0.0,  # no dropout at eval
     )
 
     with open(model_path, "rb") as f:
@@ -215,15 +233,10 @@ def main():
     if not torch.cuda.is_available():
         print("ERROR: CUDA required", file=sys.stderr); sys.exit(1)
     device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-    # Populate special ids from tokenizer.
-    tok_meta = json.load(open("data/tokenizer.json"))
-    for t in tok_meta.get("added_tokens", []):
-        c = t.get("content"); tid = t.get("id")
-        if c == "<pad>" and isinstance(tid, int): HP.pad_id = tid
-        elif c == "<resp>" and isinstance(tid, int): HP.resp_sep_id = tid
-        elif c == "<end>" and isinstance(tid, int): HP.end_id = tid
-    vocab_sz = max(HP.vocab_size, len(tok_meta.get("model", {}).get("vocab", {})) or HP.vocab_size)
+    vocab_sz = _populate_special_ids()
     print(f"vocab_size={vocab_sz} pad={HP.pad_id} resp={HP.resp_sep_id} end={HP.end_id}")
 
     train_ds = PairDataset("data/train_pairs.npz")
@@ -234,34 +247,61 @@ def main():
         vocab=vocab_sz, dim=HP.model_dim, num_layers=HP.num_layers,
         num_heads=HP.num_heads, mlp_mult=HP.mlp_mult,
         max_seq_len=HP.max_seq_len, pad_id=HP.pad_id,
+        dropout=HP.dropout,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"reward model params: {n_params/1e6:.2f}M")
+    print(f"reward model params: {n_params/1e6:.2f}M  bs={HP.batch_size} lr={HP.lr} dropout={HP.dropout}")
 
     opt = torch.optim.AdamW(
         model.parameters(), lr=HP.lr, betas=(HP.beta1, HP.beta2),
         weight_decay=HP.weight_decay,
     )
 
-    def lr_at(step):
-        if step < HP.warmup_steps:
-            return HP.lr * (step + 1) / HP.warmup_steps
-        return HP.lr
+    train_seconds = HP.max_wallclock_seconds * HP.train_frac
+
+    # We don't know total steps ahead of time — use time-based cosine decay.
+    def lr_at(elapsed):
+        if elapsed < 0:
+            elapsed = 0.0
+        # Warmup by step count early on, but decay by wall-clock.
+        frac = min(elapsed / max(train_seconds, 1.0), 1.0)
+        if frac < 0.02:
+            return HP.lr * (frac / 0.02)
+        # Cosine from HP.lr down to 0.1*HP.lr over remaining time.
+        t = (frac - 0.02) / (1.0 - 0.02)
+        cos = 0.5 * (1.0 + math.cos(math.pi * t))
+        return HP.lr * (0.1 + 0.9 * cos)
 
     start = time.time()
     step = 0
+    last_log = start
     model.train()
     rng = np.random.default_rng(HP.seed)
+    B = HP.batch_size
+
     while True:
         elapsed = time.time() - start
-        if elapsed >= HP.max_wallclock_seconds:
+        if elapsed >= train_seconds:
             break
-        for g in opt.param_groups: g["lr"] = lr_at(step)
-        idxs = rng.integers(0, train_ds.n, size=HP.batch_size)
+        cur_lr = lr_at(elapsed)
+        for g in opt.param_groups: g["lr"] = cur_lr
+
+        idxs = rng.integers(0, train_ds.n, size=B)
         idxs_t = torch.from_numpy(idxs).long()
         pr, ch, rj, pl, cl, rl = train_ds.batch(idxs_t, device)
-        rc = score_batch(pr, ch, pl, cl, model)
-        rr = score_batch(pr, rj, pl, rl, model)
+
+        # Pack chosen and rejected, then concatenate into one forward pass.
+        packed_c = pack_prompt_response(
+            pr, ch, pl, cl, HP.resp_sep_id, HP.end_id, HP.pad_id, HP.max_seq_len
+        )
+        packed_r = pack_prompt_response(
+            pr, rj, pl, rl, HP.resp_sep_id, HP.end_id, HP.pad_id, HP.max_seq_len
+        )
+        both = torch.cat([packed_c, packed_r], dim=0)  # (2B, L)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            r = model(both).float()
+        rc, rr = r[:B], r[B:]
+
         loss = bradley_terry_loss(rc, rr)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -269,17 +309,22 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), HP.grad_clip)
         opt.step()
         step += 1
-        if step % 50 == 0:
+
+        now = time.time()
+        if now - last_log >= 10.0:
             acc = (rc > rr).float().mean().item()
-            print(f"step={step} t={elapsed:.0f}s loss={loss.item():.4f} train_batch_acc={acc:.3f}", flush=True)
+            print(f"step={step} t={elapsed:.0f}s lr={cur_lr:.1e} loss={loss.item():.4f} train_batch_acc={acc:.3f}", flush=True)
+            last_log = now
+
+    print(f"training done: step={step} elapsed={time.time()-start:.1f}s")
 
     # Quick val
     model.eval()
     with torch.inference_mode():
         total = 0; correct = 0
-        B = 64
-        for i in range(0, val_ds.n, B):
-            j = min(i + B, val_ds.n)
+        B_eval = 128
+        for i in range(0, val_ds.n, B_eval):
+            j = min(i + B_eval, val_ds.n)
             idxs_t = torch.arange(i, j).long()
             pr, ch, rj, pl, cl, rl = val_ds.batch(idxs_t, device)
             rc = score_batch(pr, ch, pl, cl, model)
