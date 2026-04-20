@@ -39,7 +39,7 @@ class HP:
     num_layers = int(os.environ.get("NUM_LAYERS", 6))
     num_heads = int(os.environ.get("NUM_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
-    dropout = float(os.environ.get("DROPOUT", 0.0))
+    dropout = float(os.environ.get("DROPOUT", 0.05))
     max_prompt_len = 256
     max_resp_len = 384
     max_seq_len = max_prompt_len + max_resp_len + 2  # +<resp>,<end>
