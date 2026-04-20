@@ -35,7 +35,7 @@ class HP:
 
     # Model arch
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
-    model_dim = int(os.environ.get("MODEL_DIM", 256))
+    model_dim = int(os.environ.get("MODEL_DIM", 288))
     num_layers = int(os.environ.get("NUM_LAYERS", 5))
     num_heads = int(os.environ.get("NUM_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
