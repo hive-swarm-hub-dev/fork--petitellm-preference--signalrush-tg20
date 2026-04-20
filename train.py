@@ -55,6 +55,7 @@ class HP:
     train_frac = float(os.environ.get("TRAIN_FRAC", 0.99))  # reserve ~1% for save/val
     bt_margin = float(os.environ.get("BT_MARGIN", 0.0))
     anchor_w = float(os.environ.get("ANCHOR_W", 0.0))
+    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", 0.0))
 
     # Token ids populated from tokenizer.json at runtime.
     pad_id = 0
@@ -220,11 +221,21 @@ def bradley_terry_loss(r_chosen, r_rejected, margin: float = 0.0):
     return -F.logsigmoid(r_chosen - r_rejected - margin).mean()
 
 
-def pairwise_loss(r_chosen, r_rejected, margin: float = 0.0, aux_weight: float = 0.0):
-    """Bradley-Terry + optional small anchor term that keeps rewards bounded."""
-    loss = bradley_terry_loss(r_chosen, r_rejected, margin=margin)
+def pairwise_loss(r_chosen, r_rejected, margin: float = 0.0, aux_weight: float = 0.0,
+                  label_smoothing: float = 0.0):
+    """Bradley-Terry + optional label smoothing (cDPO, Mitchell 2023) + anchor.
+
+    With label_smoothing=ε, treat the preference as stochastic: the annotator
+    chose 'chosen' with prob 1-ε and 'rejected' with prob ε. Prevents reward
+    saturation on easy pairs, a common issue with standard BT on limited data.
+    """
+    diff = r_chosen - r_rejected - margin
+    if label_smoothing > 0:
+        eps = label_smoothing
+        loss = -((1 - eps) * F.logsigmoid(diff) + eps * F.logsigmoid(-diff)).mean()
+    else:
+        loss = -F.logsigmoid(diff).mean()
     if aux_weight > 0:
-        # Light L2 anchor on reward magnitudes — prevents runaway scores.
         loss = loss + aux_weight * 0.5 * (r_chosen.pow(2).mean() + r_rejected.pow(2).mean())
     return loss
 
@@ -276,12 +287,34 @@ def main():
             return HP.lr * (step + 1) / HP.warmup_steps
         return HP.lr
 
+    def quick_val(m):
+        was_training = m.training
+        m.eval()
+        correct = 0; total = 0
+        B_eval = 128
+        with torch.inference_mode():
+            for i in range(0, val_ds.n, B_eval):
+                j = min(i + B_eval, val_ds.n)
+                idxs_t = torch.arange(i, j).long()
+                pr, ch, rj, pl, cl, rl = val_ds.batch(idxs_t, device)
+                rc = score_batch(pr, ch, pl, cl, m)
+                rr = score_batch(pr, rj, pl, rl, m)
+                correct += int((rc > rr).sum().item()); total += (j - i)
+        if was_training:
+            m.train()
+        return correct / max(total, 1)
+
     start = time.time()
     step = 0
     last_log = start
     model.train()
     rng = np.random.default_rng(HP.seed)
     B = HP.batch_size
+    val_every = int(os.environ.get("VAL_EVERY", 1000))
+    val_start_step = int(os.environ.get("VAL_START_STEP", 2000))
+    best_val = -1.0
+    best_state = None
+    best_step = 0
 
     while True:
         elapsed = time.time() - start
@@ -305,13 +338,23 @@ def main():
             r = model(both).float()
         rc, rr = r[:B], r[B:]
 
-        loss = pairwise_loss(rc, rr, margin=HP.bt_margin, aux_weight=HP.anchor_w)
+        loss = pairwise_loss(rc, rr, margin=HP.bt_margin, aux_weight=HP.anchor_w,
+                             label_smoothing=HP.label_smoothing)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         if HP.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), HP.grad_clip)
         opt.step()
         step += 1
+
+        # Periodic val-based checkpoint selection.
+        if step >= val_start_step and step % val_every == 0:
+            v = quick_val(model)
+            if v > best_val:
+                best_val = v
+                best_step = step
+                best_state = {k: v2.detach().clone().cpu() for k, v2 in model.state_dict().items()}
+            print(f"[val] step={step} val_acc={v:.4f} best={best_val:.4f}@{best_step}", flush=True)
 
         now = time.time()
         if now - last_log >= 10.0:
@@ -321,19 +364,16 @@ def main():
 
     print(f"training done: step={step} elapsed={time.time()-start:.1f}s")
 
-    # Quick val
-    model.eval()
-    with torch.inference_mode():
-        total = 0; correct = 0
-        B_eval = 128
-        for i in range(0, val_ds.n, B_eval):
-            j = min(i + B_eval, val_ds.n)
-            idxs_t = torch.arange(i, j).long()
-            pr, ch, rj, pl, cl, rl = val_ds.batch(idxs_t, device)
-            rc = score_batch(pr, ch, pl, cl, model)
-            rr = score_batch(pr, rj, pl, rl, model)
-            correct += int((rc > rr).sum().item()); total += (j - i)
-        val_acc = correct / max(total, 1)
+    # Final val + choose best between running best and final model.
+    final_val = quick_val(model)
+    print(f"final val_acc={final_val:.4f}  best_seen={best_val:.4f}@{best_step}")
+
+    if best_state is not None and best_val > final_val:
+        print(f"restoring best checkpoint from step {best_step} (val={best_val:.4f} > {final_val:.4f})")
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        val_acc = best_val
+    else:
+        val_acc = final_val
     print(f"val_acc={val_acc:.4f}  steps={step}  secs={time.time()-start:.0f}")
 
     # Save
