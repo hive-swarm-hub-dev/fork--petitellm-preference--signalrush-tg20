@@ -36,7 +36,7 @@ class HP:
     # Model arch
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     model_dim = int(os.environ.get("MODEL_DIM", 256))
-    num_layers = int(os.environ.get("NUM_LAYERS", 4))
+    num_layers = int(os.environ.get("NUM_LAYERS", 5))
     num_heads = int(os.environ.get("NUM_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
     dropout = float(os.environ.get("DROPOUT", 0.0))
@@ -52,7 +52,7 @@ class HP:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     grad_clip = float(os.environ.get("GRAD_CLIP", 1.0))
-    train_frac = float(os.environ.get("TRAIN_FRAC", 0.95))  # reserve ~5% of wallclock for save/val
+    train_frac = float(os.environ.get("TRAIN_FRAC", 0.99))  # reserve ~1% for save/val
 
     # Token ids populated from tokenizer.json at runtime.
     pad_id = 0
