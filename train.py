@@ -36,7 +36,7 @@ class HP:
     # Model arch
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     model_dim = int(os.environ.get("MODEL_DIM", 288))
-    num_layers = int(os.environ.get("NUM_LAYERS", 5))
+    num_layers = int(os.environ.get("NUM_LAYERS", 6))
     num_heads = int(os.environ.get("NUM_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
     dropout = float(os.environ.get("DROPOUT", 0.0))
@@ -53,6 +53,8 @@ class HP:
     beta2 = float(os.environ.get("BETA2", 0.95))
     grad_clip = float(os.environ.get("GRAD_CLIP", 1.0))
     train_frac = float(os.environ.get("TRAIN_FRAC", 0.99))  # reserve ~1% for save/val
+    bt_margin = float(os.environ.get("BT_MARGIN", 0.0))
+    anchor_w = float(os.environ.get("ANCHOR_W", 0.0))
 
     # Token ids populated from tokenizer.json at runtime.
     pad_id = 0
@@ -218,6 +220,15 @@ def bradley_terry_loss(r_chosen, r_rejected, margin: float = 0.0):
     return -F.logsigmoid(r_chosen - r_rejected - margin).mean()
 
 
+def pairwise_loss(r_chosen, r_rejected, margin: float = 0.0, aux_weight: float = 0.0):
+    """Bradley-Terry + optional small anchor term that keeps rewards bounded."""
+    loss = bradley_terry_loss(r_chosen, r_rejected, margin=margin)
+    if aux_weight > 0:
+        # Light L2 anchor on reward magnitudes — prevents runaway scores.
+        loss = loss + aux_weight * 0.5 * (r_chosen.pow(2).mean() + r_rejected.pow(2).mean())
+    return loss
+
+
 def save_model_compressed(model: nn.Module, path: str) -> int:
     sd = {k: v.detach().to(torch.float16).cpu() for k, v in model.state_dict().items()}
     buf = io.BytesIO()
@@ -259,8 +270,8 @@ def main():
 
     train_seconds = HP.max_wallclock_seconds * HP.train_frac
 
-    # Linear warmup, then constant (matches baseline).
-    def lr_at(step):
+    # Linear warmup by step count, then constant lr (matches baseline recipe).
+    def lr_at(step, elapsed):
         if step < HP.warmup_steps:
             return HP.lr * (step + 1) / HP.warmup_steps
         return HP.lr
@@ -276,14 +287,13 @@ def main():
         elapsed = time.time() - start
         if elapsed >= train_seconds:
             break
-        cur_lr = lr_at(step)
+        cur_lr = lr_at(step, elapsed)
         for g in opt.param_groups: g["lr"] = cur_lr
 
         idxs = rng.integers(0, train_ds.n, size=B)
         idxs_t = torch.from_numpy(idxs).long()
         pr, ch, rj, pl, cl, rl = train_ds.batch(idxs_t, device)
 
-        # Pack chosen and rejected, then concatenate into one forward pass.
         packed_c = pack_prompt_response(
             pr, ch, pl, cl, HP.resp_sep_id, HP.end_id, HP.pad_id, HP.max_seq_len
         )
@@ -295,7 +305,7 @@ def main():
             r = model(both).float()
         rc, rr = r[:B], r[B:]
 
-        loss = bradley_terry_loss(rc, rr)
+        loss = pairwise_loss(rc, rr, margin=HP.bt_margin, aux_weight=HP.anchor_w)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         if HP.grad_clip > 0:
