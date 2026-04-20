@@ -39,16 +39,16 @@ class HP:
     num_layers = int(os.environ.get("NUM_LAYERS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
-    dropout = float(os.environ.get("DROPOUT", 0.1))
+    dropout = float(os.environ.get("DROPOUT", 0.0))
     max_prompt_len = 256
     max_resp_len = 384
     max_seq_len = max_prompt_len + max_resp_len + 2  # +<resp>,<end>
 
     # Optim
-    lr = float(os.environ.get("LR", 5e-4))
-    batch_size = int(os.environ.get("BATCH_SIZE", 64))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 200))
-    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.05))
+    lr = float(os.environ.get("LR", 3e-4))
+    batch_size = int(os.environ.get("BATCH_SIZE", 16))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.01))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     grad_clip = float(os.environ.get("GRAD_CLIP", 1.0))
@@ -259,18 +259,11 @@ def main():
 
     train_seconds = HP.max_wallclock_seconds * HP.train_frac
 
-    # We don't know total steps ahead of time — use time-based cosine decay.
-    def lr_at(elapsed):
-        if elapsed < 0:
-            elapsed = 0.0
-        # Warmup by step count early on, but decay by wall-clock.
-        frac = min(elapsed / max(train_seconds, 1.0), 1.0)
-        if frac < 0.02:
-            return HP.lr * (frac / 0.02)
-        # Cosine from HP.lr down to 0.1*HP.lr over remaining time.
-        t = (frac - 0.02) / (1.0 - 0.02)
-        cos = 0.5 * (1.0 + math.cos(math.pi * t))
-        return HP.lr * (0.1 + 0.9 * cos)
+    # Linear warmup, then constant (matches baseline).
+    def lr_at(step):
+        if step < HP.warmup_steps:
+            return HP.lr * (step + 1) / HP.warmup_steps
+        return HP.lr
 
     start = time.time()
     step = 0
@@ -283,7 +276,7 @@ def main():
         elapsed = time.time() - start
         if elapsed >= train_seconds:
             break
-        cur_lr = lr_at(elapsed)
+        cur_lr = lr_at(step)
         for g in opt.param_groups: g["lr"] = cur_lr
 
         idxs = rng.integers(0, train_ds.n, size=B)
